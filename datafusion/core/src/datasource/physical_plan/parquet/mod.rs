@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Execution plan for reading Parquet files
-
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Range;
@@ -27,8 +25,8 @@ use crate::datasource::physical_plan::file_stream::{
     FileOpenFuture, FileOpener, FileStream,
 };
 use crate::datasource::physical_plan::{
-    parquet::page_filter::PagePruningPredicate, DisplayAs, FileGroupPartitioner,
-    FileMeta, FileScanConfig, SchemaAdapter,
+    parquet::page_filter::PagePruningPredicate, DefaultSchemaAdapterFactory, DisplayAs,
+    FileGroupPartitioner, FileMeta, FileScanConfig,
 };
 use crate::{
     config::{ConfigOptions, TableParquetOptions},
@@ -67,9 +65,11 @@ mod metrics;
 mod page_filter;
 mod row_filter;
 mod row_groups;
+mod schema_adapter;
 mod statistics;
 
 pub use metrics::ParquetFileMetrics;
+pub use schema_adapter::{SchemaAdapter, SchemaAdapterFactory, SchemaMapper};
 
 /// Execution plan for scanning one or more Parquet partitions
 #[derive(Debug, Clone)]
@@ -92,6 +92,8 @@ pub struct ParquetExec {
     cache: PlanProperties,
     /// Parquet Options
     parquet_options: TableParquetOptions,
+    /// Optional user defined schema adapter
+    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
 }
 
 impl ParquetExec {
@@ -156,6 +158,7 @@ impl ParquetExec {
             parquet_file_reader_factory: None,
             cache,
             parquet_options,
+            schema_adapter_factory: None,
         }
     }
 
@@ -186,6 +189,19 @@ impl ParquetExec {
         parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     ) -> Self {
         self.parquet_file_reader_factory = Some(parquet_file_reader_factory);
+        self
+    }
+
+    /// Optional schema adapter factory.
+    ///
+    /// `SchemaAdapterFactory` allows user to specify how fields from the parquet file get mapped to
+    ///  that of the table schema.  The default schema adapter uses arrow's cast library to map
+    ///  the parquet fields to the table schema.
+    pub fn with_schema_adapter_factory(
+        mut self,
+        schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
+    ) -> Self {
+        self.schema_adapter_factory = Some(schema_adapter_factory);
         self
     }
 
@@ -386,6 +402,11 @@ impl ExecutionPlan for ParquetExec {
                     })
             })?;
 
+        let schema_adapter_factory = self
+            .schema_adapter_factory
+            .clone()
+            .unwrap_or_else(|| Arc::new(DefaultSchemaAdapterFactory::default()));
+
         let opener = ParquetOpener {
             partition_index,
             projection: Arc::from(projection),
@@ -402,6 +423,7 @@ impl ExecutionPlan for ParquetExec {
             reorder_filters: self.reorder_filters(),
             enable_page_index: self.enable_page_index(),
             enable_bloom_filter: self.enable_bloom_filter(),
+            schema_adapter_factory,
         };
 
         let stream =
@@ -436,6 +458,7 @@ struct ParquetOpener {
     reorder_filters: bool,
     enable_page_index: bool,
     enable_bloom_filter: bool,
+    schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
 }
 
 impl FileOpener for ParquetOpener {
@@ -459,7 +482,7 @@ impl FileOpener for ParquetOpener {
         let batch_size = self.batch_size;
         let projection = self.projection.clone();
         let projected_schema = SchemaRef::from(self.table_schema.project(&projection)?);
-        let schema_adapter = SchemaAdapter::new(projected_schema);
+        let schema_adapter = self.schema_adapter_factory.create(projected_schema);
         let predicate = self.predicate.clone();
         let pruning_predicate = self.pruning_predicate.clone();
         let page_pruning_predicate = self.page_pruning_predicate.clone();
