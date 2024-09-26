@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_coercion_logical_op() -> Result<()> {
+    fn test_type_coercion_logical_op_todogreg() -> Result<()> {
         test_coercion_binary_rule!(
             DataType::Boolean,
             DataType::Boolean,
