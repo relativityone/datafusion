@@ -936,25 +936,26 @@ fn dictionary_comparison_coercion(
 
 /// Coercion rules for string concat.
 /// This is a union of string coercion rules and specified rules:
-/// 1. At least one side of lhs and rhs should be string type (Utf8 / LargeUtf8)
+/// 1. At lease one side of lhs and rhs should be string type (Utf8 / LargeUtf8)
 /// 2. Data type of the other side should be able to cast to string type
 fn string_concat_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
-    string_coercion(lhs_type, rhs_type).or(match (lhs_type, rhs_type) {
-        (Utf8View, from_type) | (from_type, Utf8View) => {
-            string_concat_internal_coercion(from_type, &Utf8View)
+    match (lhs_type, rhs_type) {
+        // If Utf8View is in any side, we coerce to Utf8.
+        // Ref: https://github.com/apache/datafusion/pull/11796
+        (Utf8View, Utf8View | Utf8 | LargeUtf8) | (Utf8 | LargeUtf8, Utf8View) => {
+            Some(Utf8)
         }
-        (Utf8, from_type) | (from_type, Utf8) => {
-            string_concat_internal_coercion(from_type, &Utf8)
-        }
-        (LargeUtf8, from_type) | (from_type, LargeUtf8) => {
-            string_concat_internal_coercion(from_type, &LargeUtf8)
-        }
-        (Dictionary(_, lhs_value_type), Dictionary(_, rhs_value_type)) => {
-            string_coercion(lhs_value_type, rhs_value_type).or(None)
-        }
-        _ => None,
-    })
+        _ => string_coercion(lhs_type, rhs_type).or(match (lhs_type, rhs_type) {
+            (Utf8, from_type) | (from_type, Utf8) => {
+                string_concat_internal_coercion(from_type, &Utf8)
+            }
+            (LargeUtf8, from_type) | (from_type, LargeUtf8) => {
+                string_concat_internal_coercion(from_type, &LargeUtf8)
+            }
+            _ => None,
+        }),
+    }
 }
 
 fn array_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
@@ -989,26 +990,6 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
         // If Utf8View is in any side, we coerce to Utf8View.
         (Utf8View, Utf8View | Utf8 | LargeUtf8) | (Utf8 | LargeUtf8, Utf8View) => {
             Some(Utf8View)
-        }
-        // Then, if LargeUtf8 is in any side, we coerce to LargeUtf8.
-        (LargeUtf8, Utf8 | LargeUtf8) | (Utf8, LargeUtf8) => Some(LargeUtf8),
-        // Utf8 coerces to Utf8
-        (Utf8, Utf8) => Some(Utf8),
-        _ => None,
-    }
-}
-
-/// This will be deprecated when binary operators native support
-/// for Utf8View (use `string_coercion` instead).
-fn regex_comparison_string_coercion(
-    lhs_type: &DataType,
-    rhs_type: &DataType,
-) -> Option<DataType> {
-    use arrow::datatypes::DataType::*;
-    match (lhs_type, rhs_type) {
-        // If Utf8View is in any side, we coerce to Utf8.
-        (Utf8View, Utf8View | Utf8 | LargeUtf8) | (Utf8 | LargeUtf8, Utf8View) => {
-            Some(Utf8)
         }
         // Then, if LargeUtf8 is in any side, we coerce to LargeUtf8.
         (LargeUtf8, Utf8 | LargeUtf8) | (Utf8, LargeUtf8) => Some(LargeUtf8),
@@ -1107,27 +1088,13 @@ pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
         .or_else(|| list_coercion(lhs_type, rhs_type))
         .or_else(|| binary_to_string_coercion(lhs_type, rhs_type))
         .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
-        .or_else(|| regex_null_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
 }
 
-/// coercion rules for regular expression comparison operations with NULL input.
-fn regex_null_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
-    use arrow::datatypes::DataType::*;
-    match (lhs_type, rhs_type) {
-        (DataType::Null, Utf8View | Utf8 | LargeUtf8) => Some(rhs_type.clone()),
-        (Utf8View | Utf8 | LargeUtf8, DataType::Null) => Some(lhs_type.clone()),
-        (DataType::Null, DataType::Null) => Some(Utf8),
-        _ => None,
-    }
-}
-
-/// Coercion rules for regular expression comparison operations.
 /// This is a union of string coercion rules and dictionary coercion rules
 pub fn regex_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
-    regex_comparison_string_coercion(lhs_type, rhs_type)
+    string_coercion(lhs_type, rhs_type)
         .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
-        .or_else(|| regex_null_coercion(lhs_type, rhs_type))
 }
 
 /// Checks if the TimeUnit associated with a Time32 or Time64 type is consistent,
