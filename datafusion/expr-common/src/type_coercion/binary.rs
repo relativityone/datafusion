@@ -377,8 +377,6 @@ impl From<&DataType> for TypeCategory {
 /// to better match the behavior of both Postgres and DuckDB. For example, we expect adjusted
 /// decimal precision and scale when coercing decimal types.
 ///
-/// This function doesn't preserve correct field name and nullability for the struct type, we only care about data type.
-///
 /// Returns Option because we might want to continue on the code even if the data types are not coercible to the common type
 pub fn type_union_resolution(data_types: &[DataType]) -> Option<DataType> {
     if data_types.is_empty() {
@@ -490,14 +488,18 @@ fn type_union_resolution_coercion(
             fn search_corresponding_coerced_type(
                 lhs_field: &FieldRef,
                 rhs: &Fields,
-            ) -> Option<DataType> {
+            ) -> Option<(DataType, String, bool)> {
                 for rhs_field in rhs.iter() {
                     if lhs_field.name() == rhs_field.name() {
                         if let Some(t) = type_union_resolution_coercion(
                             lhs_field.data_type(),
                             rhs_field.data_type(),
                         ) {
-                            return Some(t);
+                            return Some((
+                                t,
+                                lhs_field.name().to_string(),
+                                lhs_field.is_nullable() || rhs_field.is_nullable(),
+                            ));
                         } else {
                             return None;
                         }
@@ -514,9 +516,8 @@ fn type_union_resolution_coercion(
 
             let fields = types
                 .into_iter()
-                .enumerate()
-                .map(|(i, datatype)| {
-                    Arc::new(Field::new(format!("c{i}"), datatype, true))
+                .map(|(datatype, name, nullable)| {
+                    Arc::new(Field::new(name, datatype, nullable))
                 })
                 .collect::<Vec<FieldRef>>();
             Some(DataType::Struct(fields.into()))
@@ -526,6 +527,7 @@ fn type_union_resolution_coercion(
             // that can accommodate both types
             binary_numeric_coercion(lhs_type, rhs_type)
                 .or_else(|| list_coercion(lhs_type, rhs_type))
+                .or_else(|| map_coercion(lhs_type, rhs_type))
                 .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
                 .or_else(|| string_coercion(lhs_type, rhs_type))
                 .or_else(|| numeric_string_coercion(lhs_type, rhs_type))
@@ -653,6 +655,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| string_temporal_coercion(lhs_type, rhs_type))
         .or_else(|| binary_coercion(lhs_type, rhs_type))
         .or_else(|| struct_coercion(lhs_type, rhs_type))
+        .or_else(|| map_coercion(lhs_type, rhs_type))
 }
 
 /// Similar to [`comparison_coercion`] but prefers numeric if compares with
@@ -972,17 +975,42 @@ fn struct_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
             }
 
             let types = std::iter::zip(lhs_fields.iter(), rhs_fields.iter())
-                .map(|(lhs, rhs)| comparison_coercion(lhs.data_type(), rhs.data_type()))
-                .collect::<Option<Vec<DataType>>>()?;
+                .map(|(lhs, rhs)| {
+                    match comparison_coercion(lhs.data_type(), rhs.data_type()) {
+                        Some(dt) => {
+                            let name = lhs.name().clone();
+                            let nullable = lhs.is_nullable() || rhs.is_nullable();
+                            Some((dt, name, nullable))
+                        }
+                        None => None,
+                    }
+                })
+                .collect::<Option<Vec<(DataType, String, bool)>>>()?;
 
             let fields = types
                 .into_iter()
-                .enumerate()
-                .map(|(i, datatype)| {
-                    Arc::new(Field::new(format!("c{i}"), datatype, true))
+                .map(|(datatype, name, nullable)| {
+                    Arc::new(Field::new(name, datatype, nullable))
                 })
                 .collect::<Vec<FieldRef>>();
             Some(Struct(fields.into()))
+        }
+        _ => None,
+    }
+}
+
+fn map_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+    match (lhs_type, rhs_type) {
+        (Map(lhs_field, lhs_ordered), Map(rhs_field, rhs_ordered)) => {
+            struct_coercion(lhs_field.data_type(), rhs_field.data_type()).map(
+                |key_value_type| {
+                    Map(
+                        Arc::new((**lhs_field).clone().with_data_type(key_value_type)),
+                        *lhs_ordered && *rhs_ordered,
+                    )
+                },
+            )
         }
         _ => None,
     }
